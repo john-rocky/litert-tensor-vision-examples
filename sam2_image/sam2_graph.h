@@ -23,6 +23,7 @@
 #define TENSOR_EXAMPLES_SAM2_IMAGE_SAM2_GRAPH_H_
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
@@ -82,6 +83,13 @@ WeightMap MakeSyntheticWeights(const Sam2Config& config, unsigned seed);
 
 EncoderInputs MakeEncoderInputs(const Sam2Config& config);
 DecoderInputs MakeDecoderInputs(const Sam2Config& config);
+
+// odml.runtime_bmm control inputs created during the LAST Build*() call
+// (one int32 [1,1,1,7] graph input per distinct bound length S, named
+// "rbmm_s<S>"). The caller appends the tensors to that signature's input
+// list and feeds each with seven int32 copies of S at runtime (the proven
+// attn_bench fill pattern). Returns and clears the registry.
+std::vector<std::pair<int, TfTensor>> TakeRbmmParams();
 
 EncoderOutputs BuildEncoder(const Sam2Config& config,
                             const EncoderInputs& inputs,

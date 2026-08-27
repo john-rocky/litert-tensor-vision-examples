@@ -40,6 +40,14 @@ struct Sam2Config {
   // Emission toggles (raw decompositions and composites are numerically
   // identical on CPU; composites unlock fused delegate kernels).
   bool use_sdpa_composite = false;
+  // odml.runtime_bmm pair per attention (QK + AV composites with an int32
+  // [1,1,1,7] control input, element 2 = full length — SAM2 shapes are
+  // static, so both sides are bounded at full fill, which is complete
+  // computation; the audio-side stale-tail hazard needs active < S).
+  bool use_rbmm_attention = false;
+  // The hypernetwork mask projection (activation x activation) as a single
+  // dst-bounded odml.runtime_bmm at rank 4.
+  bool use_rbmm_hypernet = false;
   bool use_layer_norm_composite = false;
   // Mask upsampler form: TRANSPOSE_CONV directly, or the exact
   // 4x(1x1)+concat+DepthToSpace expansion (k2/s2 transposed conv has zero

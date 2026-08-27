@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/flags/flag.h"  // from @com_google_absl
@@ -50,8 +51,12 @@ ABSL_FLAG(std::string, gpu_buffer_storage, "default",
           "default|buffer|texture2d — GPU tensor storage (texture limits "
           "can silently push large graphs to CPU; probe with buffer)");
 ABSL_FLAG(std::string, attention, "raw",
-          "raw|sdpa — plain ops or the odml.scaled_dot_product_attention "
-          "composite");
+          "raw|sdpa|rbmm — plain ops, the odml.scaled_dot_product_attention "
+          "composite, or the odml.runtime_bmm QK+AV pair (int32 control "
+          "inputs bound at the full static length)");
+ABSL_FLAG(std::string, hypernet, "raw",
+          "raw|rbmm — the hypernetwork mask projection as a plain "
+          "BatchMatMul or one dst-bounded odml.runtime_bmm");
 ABSL_FLAG(std::string, norms, "raw",
           "raw|composite — plain ops or the odml.layer_norm composite");
 ABSL_FLAG(std::string, upsampler, "transpose",
@@ -135,10 +140,16 @@ absl::Status DumpFile(const std::string& dir, const std::string& name,
 absl::Status Run() {
   sam2::Sam2Config config;
   const std::string attention = absl::GetFlag(FLAGS_attention);
-  if (attention != "raw" && attention != "sdpa") {
-    return absl::InvalidArgumentError("--attention must be raw|sdpa");
+  if (attention != "raw" && attention != "sdpa" && attention != "rbmm") {
+    return absl::InvalidArgumentError("--attention must be raw|sdpa|rbmm");
   }
   config.use_sdpa_composite = attention == "sdpa";
+  config.use_rbmm_attention = attention == "rbmm";
+  const std::string hypernet = absl::GetFlag(FLAGS_hypernet);
+  if (hypernet != "raw" && hypernet != "rbmm") {
+    return absl::InvalidArgumentError("--hypernet must be raw|rbmm");
+  }
+  config.use_rbmm_hypernet = hypernet == "rbmm";
   const std::string norms = absl::GetFlag(FLAGS_norms);
   if (norms != "raw" && norms != "composite") {
     return absl::InvalidArgumentError("--norms must be raw|composite");
@@ -167,19 +178,28 @@ absl::Status Run() {
     std::cout << "attention: odml.scaled_dot_product_attention composite"
               << std::endl;
   }
+  if (config.use_rbmm_attention) {
+    std::cout << "attention: odml.runtime_bmm QK+AV pair" << std::endl;
+  }
+  if (config.use_rbmm_hypernet) {
+    std::cout << "hypernet: odml.runtime_bmm" << std::endl;
+  }
   if (config.use_layer_norm_composite) {
     std::cout << "norms: odml.layer_norm composite" << std::endl;
   }
 
   sam2::EncoderInputs enc_in = sam2::MakeEncoderInputs(config);
   sam2::EncoderOutputs enc_out = sam2::BuildEncoder(config, enc_in, weights);
+  auto enc_rbmm = sam2::TakeRbmmParams();
   sam2::DecoderInputs dec_in = sam2::MakeDecoderInputs(config);
   sam2::DecoderOutputs dec_out = sam2::BuildDecoder(config, dec_in, weights);
+  auto dec_rbmm = sam2::TakeRbmmParams();
 
   ModelFactory factory;
   {
     std::vector<::litert::tensor::TensorHandle> ins, outs;
     for (auto& t : enc_in.AsList()) ins.push_back(t);
+    for (auto& [s, t] : enc_rbmm) ins.push_back(t);
     for (auto& t : enc_out.AsList()) outs.push_back(t);
     auto status = factory.AddSignature(ins, outs, "encode_image");
     if (!status.ok()) return status;
@@ -187,6 +207,7 @@ absl::Status Run() {
   {
     std::vector<::litert::tensor::TensorHandle> ins, outs;
     for (auto& t : dec_in.AsList()) ins.push_back(t);
+    for (auto& [s, t] : dec_rbmm) ins.push_back(t);
     for (auto& t : dec_out.AsList()) outs.push_back(t);
     auto status = factory.AddSignature(ins, outs, "decode_mask");
     if (!status.ok()) return status;
@@ -200,9 +221,11 @@ absl::Status Run() {
   if (!split_dir.empty()) {
     sam2::EncoderInputs enc_in2 = sam2::MakeEncoderInputs(config);
     sam2::EncoderOutputs enc_out2 = sam2::BuildEncoder(config, enc_in2, weights);
+    auto enc_rbmm2 = sam2::TakeRbmmParams();
     ModelFactory enc_factory;
     std::vector<::litert::tensor::TensorHandle> ins, outs;
     for (auto& t : enc_in2.AsList()) ins.push_back(t);
+    for (auto& [s, t] : enc_rbmm2) ins.push_back(t);
     for (auto& t : enc_out2.AsList()) outs.push_back(t);
     auto st1 = enc_factory.AddSignature(ins, outs, "encode_image");
     if (!st1.ok()) return st1;
@@ -211,10 +234,12 @@ absl::Status Run() {
 
     sam2::DecoderInputs dec_in2 = sam2::MakeDecoderInputs(config);
     sam2::DecoderOutputs dec_out2 = sam2::BuildDecoder(config, dec_in2, weights);
+    auto dec_rbmm2 = sam2::TakeRbmmParams();
     ModelFactory dec_factory;
     ins.clear();
     outs.clear();
     for (auto& t : dec_in2.AsList()) ins.push_back(t);
+    for (auto& [s, t] : dec_rbmm2) ins.push_back(t);
     for (auto& t : dec_out2.AsList()) outs.push_back(t);
     auto st2 = dec_factory.AddSignature(ins, outs, "decode_mask");
     if (!st2.ok()) return st2;
@@ -298,6 +323,30 @@ absl::Status Run() {
                            Create("point_coords", Type::kFP32, {1, 1, 2},
                                   std::vector<float>{px, py}));
   };
+
+  // odml.runtime_bmm control inputs: seven int32 copies of the bound
+  // length S per input (the proven attn_bench fill pattern; element 2 is
+  // the one the kernels read). Set once — inputs persist across Run().
+  auto set_rbmm_params =
+      [&](const std::string& sig,
+          const std::vector<std::pair<int, sam2::TfTensor>>& params)
+      -> absl::Status {
+    for (const auto& [s, t] : params) {
+      const std::string name = absl::StrCat("rbmm_s", s);
+      auto st = runner.SetInput(
+          sig, name,
+          Create(name, Type::kI32, {1, 1, 1, 7},
+                 std::vector<int32_t>(7, s)));
+      if (!st.ok()) return st;
+    }
+    return absl::OkStatus();
+  };
+  {
+    auto st = set_rbmm_params("encode_image", enc_rbmm);
+    if (!st.ok()) return st;
+    st = set_rbmm_params("decode_mask", dec_rbmm);
+    if (!st.ok()) return st;
+  }
 
   // --- Warmup + correctness pass ---
   auto st = set_pixels();

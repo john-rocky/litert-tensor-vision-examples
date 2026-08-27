@@ -17,7 +17,8 @@ converter. Companion repo to
   the 128-grid re-composed positional embedding, the dense image PE grid,
   the no-mask dense row, and the output tokens — no gather/broadcast at
   runtime. Windowing is expressed with <=4-D reshapes only; attention is
-  rank-4 everywhere. Toggles: `--attention=raw|sdpa`,
+  rank-4 everywhere. Toggles: `--attention=raw|sdpa|rbmm` (the
+  `odml.runtime_bmm` QK+AV pair), `--hypernet=raw|rbmm`,
   `--norms=raw|composite`, `--upsampler=transpose|d2s` (an exact
   4x(1x1)+concat+DepthToSpace expansion of the k2/s2 transposed conv —
   the taps never overlap, so the sums are identical),

@@ -66,6 +66,53 @@ TfTensor PadHW(const TfTensor& x, int top, int bottom, int left, int right) {
 // talker example's pattern).
 bool g_layer_norm_composite = false;
 bool g_sdpa_composite = false;
+bool g_rbmm_attention = false;
+bool g_rbmm_hypernet = false;
+
+// odml.runtime_bmm control inputs for the CURRENT Build*() call, one per
+// distinct bound length S. The ml_drift parser requires the control tensor
+// to be a RUNTIME input (GetNumberOfRuntimeInputsForNode != 3 rejects the
+// node outright), so these are graph inputs, not constants.
+std::vector<std::pair<int, TfTensor>> g_rbmm_params;
+
+TfTensor GetRbmmParam(int s) {
+  for (const auto& [len, tensor] : g_rbmm_params) {
+    if (len == s) return tensor;
+  }
+  TfTensor param({.name = absl::StrCat("rbmm_s", s),
+                  .type = Type::kI32,
+                  .shape = {1, 1, 1, 7}});
+  g_rbmm_params.emplace_back(s, param);
+  return param;
+}
+
+std::vector<uint8_t> RuntimeBmmAttributes(bool is_src) {
+  flexbuffers::Builder fbb;
+  fbb.Map([&]() {
+    fbb.Bool("is_global", true);
+    fbb.Bool("is_src", is_src);
+    fbb.Bool("rhs_cache_update", false);
+  });
+  fbb.Finish();
+  return fbb.GetBuffer();
+}
+
+// The runtime_bmm contract (parser: transpose_right=true): LHS [B,H,M,K] x
+// RHS [B,H,N,K] -> [B,H,M,N]; the batch dim merges into H on the delegate
+// when B > 1 (window attention). Decompositions are plain BatchMatMuls that
+// ignore the control tensor, so CPU execution equals the raw path.
+TfTensor RuntimeBmm(const TfTensor& lhs, const TfTensor& rhs,
+                    const TfTensor& param, bool is_src) {
+  StableHLOCompositeOptions opts{
+      .name = "odml.runtime_bmm",
+      .composite_attributes = RuntimeBmmAttributes(is_src)};
+  return StableHLOComposite(
+      opts,
+      [](TfTensor l, TfTensor r, TfTensor /*p*/) {
+        return BatchMatMul(l, r, /*adj_x=*/false, /*adj_y=*/true);
+      },
+      lhs, rhs, param);
+}
 
 std::vector<uint8_t> EpsilonAttributes(float eps) {
   flexbuffers::Builder fbb;
@@ -153,6 +200,22 @@ TfTensor Mha(const TfTensor& q, const TfTensor& k, const TfTensor& v,
           return Transpose(o, {0, 2, 1, 3});
         },
         q4, k4, v4);
+  } else if (g_rbmm_attention) {
+    // QK + AV odml.runtime_bmm pair with in-graph scale + softmax between.
+    // Both sides bound at the full length (elem2 = nk): dst-bounded QK
+    // writes every column and src-bounded AV reduces every position, so
+    // the composition is complete computation — no stale-tail hazard at
+    // full fill (that needs active < S).
+    TfTensor qt = Transpose(q4, {0, 2, 1, 3});   // [B,H,M,D]
+    TfTensor kt = Transpose(k4, {0, 2, 1, 3});   // [B,H,N,D]
+    TfTensor param = GetRbmmParam(nk);
+    TfTensor scores = RuntimeBmm(qt, kt, param, /*is_src=*/false);
+    scores = Mul(scores, ConstScalar(scale));
+    TfTensor attn = Softmax(scores);             // [B,H,M,N]
+    TfTensor v4t = Transpose(v4, {0, 2, 3, 1});  // [B,H,D,N] (positions on
+                                                 // channels — the AV layout)
+    TfTensor o = RuntimeBmm(attn, v4t, param, /*is_src=*/true);  // [B,H,M,D]
+    out = Transpose(o, {0, 2, 1, 3});
   } else {
     TfTensor qt = Transpose(q4, {0, 2, 1, 3});
     TfTensor kt = Transpose(k4, {0, 2, 1, 3});
@@ -538,11 +601,19 @@ DecoderInputs MakeDecoderInputs(const Sam2Config& config) {
   return inputs;
 }
 
+std::vector<std::pair<int, TfTensor>> TakeRbmmParams() {
+  std::vector<std::pair<int, TfTensor>> params = std::move(g_rbmm_params);
+  g_rbmm_params.clear();
+  return params;
+}
+
 EncoderOutputs BuildEncoder(const Sam2Config& config,
                             const EncoderInputs& inputs,
                             const WeightMap& weights) {
   g_layer_norm_composite = config.use_layer_norm_composite;
   g_sdpa_composite = config.use_sdpa_composite;
+  g_rbmm_attention = config.use_rbmm_attention;
+  g_rbmm_hypernet = config.use_rbmm_hypernet;
 
   // Patch embed: explicit 3px pad + VALID 7x7/s4 (torch padding semantics —
   // TFLite SAME would pad 1+2 at stride 4 and shift the sampling grid).
@@ -609,6 +680,8 @@ DecoderOutputs BuildDecoder(const Sam2Config& config,
                             const WeightMap& weights) {
   g_layer_norm_composite = config.use_layer_norm_composite;
   g_sdpa_composite = config.use_sdpa_composite;
+  g_rbmm_attention = config.use_rbmm_attention;
+  g_rbmm_hypernet = config.use_rbmm_hypernet;
 
   const int eg = config.embed_grid();
   const int mg = config.mask_grid();
@@ -749,8 +822,19 @@ DecoderOutputs BuildDecoder(const Sam2Config& config,
   TfTensor hyper_all = Concatenation({hyper[0], hyper[1], hyper[2]},
                                      /*axis=*/1);  // [1,3,32]
   TfTensor up_flat = Reshape(up, {1, mg * mg, 32});
-  TfTensor masks = BatchMatMul(hyper_all, up_flat, /*adj_x=*/false,
-                               /*adj_y=*/true);  // [1,3,mg*mg]
+  TfTensor masks;
+  if (g_rbmm_hypernet) {
+    // The activation x activation projection as one dst-bounded
+    // runtime_bmm at rank 4 (elem2 = mg*mg = full width).
+    TfTensor h4 = Reshape(hyper_all, {1, 1, 3, 32});
+    TfTensor u4 = Reshape(up_flat, {1, 1, mg * mg, 32});
+    TfTensor param = GetRbmmParam(mg * mg);
+    TfTensor m4 = RuntimeBmm(h4, u4, param, /*is_src=*/false);
+    masks = Reshape(m4, {1, 3, mg * mg});
+  } else {
+    masks = BatchMatMul(hyper_all, up_flat, /*adj_x=*/false,
+                        /*adj_y=*/true);  // [1,3,mg*mg]
+  }
 
   DecoderOutputs outputs;
   outputs.masks = Reshape(masks, {1, 3, mg, mg});
