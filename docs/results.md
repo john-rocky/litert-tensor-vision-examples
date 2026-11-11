@@ -17,7 +17,7 @@
 ## Measured highlights (video path, 1024, warm medians)
 
 Three bench windows. In each, the image model was timed again and matched
-the earlier 8.0 / 1.06 ms. Every number moved by less than 0.6% between
+the earlier 8.0 / 1.06 ms. The per-frame totals moved by less than 0.6% between
 windows.
 
 - Parity vs the HF streaming reference (`Sam2VideoModel`, fp32, 10-frame
@@ -35,7 +35,7 @@ windows.
   same contract as the reference pipeline. The in-graph signature-state
   variant (odml.cache_update + the PR #8796 feedback-loop runner) is
   blocked on Metal by the second-Run buffer re-registration gap (finding
-  15 in the audio repo's FINDINGS.md, confirmed again at this LiteRT commit
+  15 in the audio repo's FINDINGS.md, confirmed again at LiteRT a19d8fa
   on 2026-08-27); the CPU path of that
   contract is proven bit-exact over 64 chained steps on the audio side.
 

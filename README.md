@@ -6,14 +6,13 @@ It is my own example code for LiteRT C++ developers, not part of LiteRT. There i
 
 | Device, fp16 | Image encoder | Mask decoder |
 |---|---|---|
-| Apple M4 Max, Metal | 8.0 ms | 1.06 ms |
 | iPhone 17 Pro | 36.2 ms | 1.8 ms |
 
-Video tracking takes 94 ms per frame with a memory bank of 7 slots and 64 ms with 2, on the M4 Max in fp16. The image masks match Hugging Face transformers in fp32 (correlation 1.000000). In fp32, the video masks match its streaming reference over a 10-frame synthetic clip (minimum IoU 1.0000), and in fp16 on Metal the minimum video mask IoU is 0.9950. The iPhone numbers come from a test app that is not in this repo.
+Video tracking takes 94 ms per frame with a memory bank of 7 slots and 64 ms with 2, on the M4 Max in fp16. The image masks match Hugging Face transformers in fp32 (correlation 1.000000). In fp32, the video masks match its streaming reference over a 10-frame synthetic clip (minimum IoU 1.0000), and in fp16 on Metal the minimum video mask IoU is 0.9950. The Mac image timings are in [Timings and output comparisons](docs/results.md). The iPhone numbers come from a test app that is not in this repo.
 
 ## Building
 
-Copy both folders into a LiteRT checkout (tested at a19d8fa with [PR #8796](https://github.com/google-ai-edge/LiteRT/pull/8796) cherry-picked, which this code does not use):
+Copy both folders into a LiteRT checkout at commit a19d8fa (tested there with [PR #8796](https://github.com/google-ai-edge/LiteRT/pull/8796) cherry-picked, which this code does not use). LiteRT main has since removed the `SafetensorLoader::QuantizedLoadMode` this code calls ([6c65ceb](https://github.com/google-ai-edge/LiteRT/commit/6c65ceb1deff1f3c9f1af349b2d2bbc34da79cdf)):
 
 ```
 cp -r sam2_image sam2_video <litert>/tensor/examples/
@@ -45,7 +44,7 @@ sam2_main --weights=<sam2_tiny_512_clean.safetensors> \
   --runs=20 --warmup=5 [--dump_dir=<dir>] [--split_dir=<dir>]
 ```
 
-With no input it uses a built-in test image and a point at the center. `--input_file` takes your own image as a raw fp32 file, already normalized, in NHWC [1,512,512,3], and `--point_x` and `--point_y` set the point. `--dump_dir` writes the mask and the other tensors as raw files.
+With no input it uses a built-in test image and a point at the center. `--input_file` takes your own image as a raw fp32 file, already ImageNet-normalized, in NHWC [1,512,512,3], and `--point_x` and `--point_y` set the point. `--dump_dir` writes the mask and the other tensors as raw files.
 
 Video tracking needs its own weights: `sam2_video/verify/export_weights_1024.py` exports them from `facebook/sam2.1-hiera-tiny`. `verify_video_1024.py` writes a synthetic clip of a white disk moving on black, makes a Hugging Face reference and compares the result. `--nmm` is the number of memory slots.
 
