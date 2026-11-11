@@ -1,10 +1,9 @@
 # Findings ledger — LiteRT / delegates, from the SAM2 vision examples
 
 Same format as the audio repo's ledger. One line per finding; status:
-`open` = reported, awaiting guidance; `workaround` = we ship around it;
-`documented` = behavior note, no action needed. Routing (in-thread vs
-GitHub issue) is always the LiteRT team's call — repros stay ready either
-way. Backend "Metal" = macOS/iOS prebuilt accelerator at LiteRT a19d8fa;
+`open` = not resolved; `workaround` = we ship around it;
+`documented` = behavior note, no action needed. Repros stay ready.
+Backend "Metal" = macOS/iOS prebuilt accelerator at LiteRT a19d8fa;
 "CL" = ML Drift / LITERT_CL on a Pixel 8a.
 
 | # | finding | backend | status | repro / notes |
